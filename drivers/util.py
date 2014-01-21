@@ -88,7 +88,7 @@ def roundup(divisor, value):
     if value == 0:
         value = 1
     if value % divisor != 0:
-        return ((value / divisor) + 1) * divisor
+        return ((int(value) / divisor) + 1) * divisor
     return value
 
 def to_plain_string(obj):
@@ -1651,3 +1651,8 @@ def open_atomic(path, mode=None):
 def isInvalidVDI(exception):
     return exception.details[0] == "HANDLE_INVALID" or \
             exception.details[0] == "UUID_INVALID"
+
+def is_daemon_running(path):
+    cmd = ["/sbin/pidof", "-s", path]
+    (rc,stdout,stderr) = doexec(cmd)
+    return (rc==0)
