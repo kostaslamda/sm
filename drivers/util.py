@@ -1656,3 +1656,4 @@ def is_daemon_running(path):
     cmd = ["/sbin/pidof", "-s", path]
     (rc,stdout,stderr) = doexec(cmd)
     return (rc==0)
+

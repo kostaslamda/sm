@@ -939,4 +939,9 @@
                 <description>OCFS filesystem creation error</description>
                 <value>452</value>
         </code>
+        <code>
+                <name>VGReg</name>
+                <description>VG Registration failure</description>
+                <value>453</value>
+        </code>
 </SM-errorcodes>
