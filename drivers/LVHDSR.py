@@ -84,7 +84,8 @@ OPS_EXCLUSIVE = [
 class LVHDSR(SR.SR):
     DRIVER_TYPE = 'lvhd'
 
-    THIN_PROVISIONING_DEFAULT = False
+    PROVISIONING_TYPES = ["thin", "thick", "dynamic"]
+    PROVISIONING_DEFAULT = "thick"
     THIN_PLUGIN = "lvhd-thin"
 
     PLUGIN_ON_SLAVE = "on-slave"
@@ -158,7 +159,7 @@ class LVHDSR(SR.SR):
         self.vgname = lvhdutil.VG_PREFIX + self.uuid
         self.path = os.path.join(lvhdutil.VG_LOCATION, self.vgname)
         self.mdpath = os.path.join(self.path, self.MDVOLUME_NAME)
-        self.thinpr = self.THIN_PROVISIONING_DEFAULT
+        self.provision = self.PROVISIONING_DEFAULT
         try:
             self.lvmCache = lvmcache.LVMCache(self.vgname)
         except:
@@ -170,14 +171,11 @@ class LVHDSR(SR.SR):
             return # must be a probe call
         # Test for thick vs thin provisioning conf parameter
         if self.dconf.has_key('allocation'):
-            alloc = self.dconf['allocation']
-            if alloc == 'thin':
-                self.thinpr = True
-            elif alloc == 'thick':
-                self.thinpr = False
+            if self.dconf['allocation'] in self.PROVISIONING_TYPES:
+                self.provision = self.dconf['allocation']
             else:
                 raise xs_errors.XenError('InvalidArg', \
-                        opterr='Allocation parameter must be either thick or thin')
+                        opterr='Allocation parameter must be one of %s' % self.PROVISIONING_TYPES)
 
         self.other_conf = self.session.xenapi.SR.get_other_config(self.sr_ref)
         if self.other_conf.get(self.TEST_MODE_KEY):
@@ -185,11 +183,9 @@ class LVHDSR(SR.SR):
             self._prepareTestMode()
 
         self.sm_config = self.session.xenapi.SR.get_sm_config(self.sr_ref)
-        # sm_config flag overrides PBD
-        if self.sm_config.get('allocation') == "thick":
-            self.thinpr = False
-        elif self.sm_config.get('allocation') == "thin":
-            self.thinpr = True
+        # sm_config flag overrides PBD, if any
+        if self.sm_config.get('allocation') in self.PROVISIONING_TYPES:
+            self.provision = self.sm_config.get('allocation')
 
         if self.sm_config.get(self.FLAG_USE_VHD) == "true":
             self.legacyMode = False
@@ -407,16 +403,11 @@ class LVHDSR(SR.SR):
                 raise Exception("Failed to get SR information from metadata.")
         
             if sr_info.has_key("allocation"):
-		if sr_info.get("allocation") == 'thick':
-                    self.thinpr = False
-                    map['allocation'] = 'thick'
-            	elif sr_info.get("allocation") == 'thin':
-                    self.thinpr = True
-                    map['allocation'] = 'thin'
+                self.provision = sr_info.get("allocation")
+                map['allocation'] = sr_info.get("allocation")
             else:
-		raise Exception("Allocation key not found in SR metadata. " \
-		    "SR info found: %s" % sr_info)
-
+                raise Exception("Allocation key not found in SR metadata. " \
+                                "SR info found: %s" % sr_info)
         except Exception, e:
             raise xs_errors.XenError('MetadataError', \
                          opterr='Error reading SR params from ' \
@@ -437,21 +428,16 @@ class LVHDSR(SR.SR):
             # activate the management volume, will be deactivated at detach time
             self.lvmCache.activateNoRefcount(self.MDVOLUME_NAME)
             
-            if self.thinpr:
-                allocstr = "thin"
-            else:
-                allocstr = "thick"
-
             name_label = util.to_plain_string(\
                             self.session.xenapi.SR.get_name_label(self.sr_ref))
             name_description = util.to_plain_string(\
                     self.session.xenapi.SR.get_name_description(self.sr_ref))
             map[self.FLAG_USE_VHD] = "true"
-            map['allocation'] = allocstr
+            map['allocation'] = self.provision
             self.session.xenapi.SR.set_sm_config(self.sr_ref, map)
 
             # Add the SR metadata
-            self.updateSRMetadata(allocstr)
+            self.updateSRMetadata(self.provision)
         except Exception, e:
             raise xs_errors.XenError('MetadataError', \
                         opterr='Error introducing Metadata Volume: %s' % str(e))
@@ -620,6 +606,31 @@ class LVHDSR(SR.SR):
         # Set the block scheduler
         for dev in self.root.split(','): self.block_setscheduler(dev)
 
+        if self.provision == "dynamic":
+            # Update slave thin provision daemon with the pool master IP
+            # TODO: This needs to be done only for the very first LVHD SR attach
+            if not self.isMaster:
+                try:
+                    pool_master_ip = util.get_pool_master_info("address")
+                    cmd = [lvutil.DYNAMIC_DAEMON_CLI, "--slave", pool_master_ip]
+                    util.pread2(cmd)
+                except util.CommandException, inst:
+                    raise xs_errors.XenError('VGReg', \
+                            opterr='failed for %s with %d' % (uuid, inst.code))
+
+            # Register VG name with thin-tapdisk daemon if the VG is local or 
+            # if the host if Master. 
+            srRef = self.session.xenapi.SR.get_by_uuid(uuid)
+            srRecord = self.session.xenapi.SR.get_record(srRef)
+            # Pass the info on new VG to thin provision daemon
+            if self.isMaster or srRecord["type"] == "lvm":
+                try:
+                    cmd = [lvutil.DYNAMIC_DAEMON_CLI, "--add", lvhdutil.VG_PREFIX + uuid]
+                    util.pread2(cmd)
+                except util.CommandException, inst:
+                    raise xs_errors.XenError('VGReg', \
+                            opterr='failed for %s with %d' % (uuid, inst.code))
+
     def detach(self, uuid):
         util.SMlog("LVHDSR.detach for %s" % self.uuid)
         cleanup.abort(self.uuid)
@@ -674,6 +685,20 @@ class LVHDSR(SR.SR):
         # However, we should still delete lock files on slaves as it is the 
         # only place to do so.
         self._cleanup(self.isMaster)
+
+        # De-Register VG name with thin-tapdisk daemon if the VG is local or 
+        # if the host if Master. Error could be ignored at this point
+        if self.provision == "dynamic":
+            srRef = self.session.xenapi.SR.get_by_uuid(uuid)
+            srRecord = self.session.xenapi.SR.get_record(srRef)
+            # Pass the info on new VG to thin provision daemon
+            if self.isMaster or srRecord["type"] == "lvm":
+                try:
+                    cmd = [lvutil.DYNAMIC_DAEMON_CLI, "--del", lvhdutil.VG_PREFIX + uuid]
+                    util.pread2(cmd)
+                except util.CommandException, inst:
+                    util.SMlog("VG de-registration failed for %s with %d" % \
+                               (uuid, inst.code))
 
     def forget_vdi(self, uuid):
         if not self.legacyMode:
@@ -743,11 +768,12 @@ class LVHDSR(SR.SR):
                                 sm_config['vhd-parent'] = parent[len( \
                                     lvhdutil.LV_PREFIX[vhdutil.VDI_TYPE_VHD]):]
                             size = vhdutil.getSizeVirt(lvPath)
-                            if self.thinpr:
+                            if self.provision == "thin":
                                 utilisation = \
                                     util.roundup(lvutil.LVM_SIZE_INCREMENT,
                                       vhdutil.calcOverheadEmpty(lvhdutil.MSIZE))
                             else:
+                                # We show the VHD size for both dynamic and thick.
                                 utilisation = lvhdutil.calcSizeVHDLV(long(size))
                         
                         vdi_ref = self.session.xenapi.VDI.db_introduce(
@@ -1281,6 +1307,9 @@ class LVHDVDI(VDI.VDI):
 
     JRN_CLONE = "clone" # journal entry type for the clone operation
 
+    DYNAMIC_PROVISIONING_FACTOR = .2
+    DYNAMIC_PROVISIONING_MIN = 200 * 1024 * 1024
+
     def load(self, vdi_uuid):
         self.lock = self.sr.lock
         self.lvActivator = self.sr.lvActivator
@@ -1342,11 +1371,16 @@ class LVHDVDI(VDI.VDI):
         if self.vdi_type == vhdutil.VDI_TYPE_RAW:
             lvSize = util.roundup(lvutil.LVM_SIZE_INCREMENT, long(size))
         else:
-            if self.sr.thinpr:
+            if self.sr.provision == "thin":
                 lvSize = util.roundup(lvutil.LVM_SIZE_INCREMENT, 
                         vhdutil.calcOverheadEmpty(lvhdutil.MSIZE))
-            else:
+            elif self.sr.provision == "thick":
                 lvSize = lvhdutil.calcSizeVHDLV(long(size))
+            elif self.sr.provision == "dynamic":
+                dynamic_sz = max(lvhdutil.calcSizeVHDLV(long(size)) * \
+                                        self.DYNAMIC_PROVISIONING_FACTOR,  
+                                 self.DYNAMIC_PROVISIONING_MIN)
+                lvSize = util.roundup(lvutil.LVM_SIZE_INCREMENT, dynamic_sz)
 
         self.sm_config = self.sr.srcmd.params["vdi_sm_config"]
         self.sr._ensureSpaceAvailable(lvSize)
@@ -1432,7 +1466,8 @@ class LVHDVDI(VDI.VDI):
             needInflate = False
         else:
             self._loadThis()
-            if self.utilisation >= lvhdutil.calcSizeVHDLV(self.size):
+            # TODO, skip the check if dynamic
+            if self.utilisation >= lvhdutil.calcSizeVHDLV(self.size) or self.sr.provision == "dynamic":
                 needInflate = False
 
         if needInflate:
@@ -1457,7 +1492,7 @@ class LVHDVDI(VDI.VDI):
         needDeflate = True
         if self.vdi_type == vhdutil.VDI_TYPE_RAW or already_deflated:
             needDeflate = False
-        elif not self.sr.thinpr:
+        elif self.sr.provision == "thick" or self.sr.provision == "dynamic":
             needDeflate = False
             # except for snapshots, which are always deflated
             vdi_ref = self.sr.srcmd.params['vdi_ref']
@@ -1508,7 +1543,7 @@ class LVHDVDI(VDI.VDI):
         else:
             lvSizeOld = self.utilisation
             lvSizeNew = lvhdutil.calcSizeVHDLV(size)
-            if self.sr.thinpr:
+            if self.sr.provision == "thin":
                 # VDI is currently deflated, so keep it deflated
                 lvSizeNew = lvSizeOld
         assert(lvSizeNew >= lvSizeOld)
@@ -1681,7 +1716,7 @@ class LVHDVDI(VDI.VDI):
             hostRefs = util.get_hosts_attached_on(self.session, [self.uuid])
             if hostRefs:
                 lvSizeOrig = fullpr
-        if not self.sr.thinpr:
+        if self.sr.provision == "thick" or self.sr.provision == "dynamic":
             if not self.issnap:
                 lvSizeOrig = fullpr
             if self.sr.cmd != "vdi_snapshot":

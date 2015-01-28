@@ -88,7 +88,7 @@ def roundup(divisor, value):
     if value == 0:
         value = 1
     if value % divisor != 0:
-        return ((value / divisor) + 1) * divisor
+        return ((int(value) / divisor) + 1) * divisor
     return value
 
 def to_plain_string(obj):
@@ -1703,3 +1703,20 @@ def read_caching_is_restricted(session):
             restrictions['restrict_read_caching'] == "true":
         return True
     return False
+
+def is_daemon_running(path):
+    cmd = ["/sbin/pidof", "-s", path]
+    (rc,stdout,stderr) = doexec(cmd)
+    return (rc==0)
+
+# Funtion could be used to retrite master record info. e.g. IP address
+def get_pool_master_info(attrib):
+    try:
+        session = get_localAPI_session()
+        master_ref = session.xenapi.pool.get_all_records().values()[0]["master"]
+        master_rec = session.xenapi.host.get_record(master_ref)
+    
+        if master_rec.has_key(attrib):
+            return master_rec[attrib]
+    finally:
+        session.xenapi.logout()
